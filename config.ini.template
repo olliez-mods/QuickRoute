@@ -1,6 +1,18 @@
 # Port the proxy listens on
 port=80
 
+# HTTPS for every domain that has a certbot certificate; http to those domains redirects to https.
+# Get a certificate (once per domain, renewals are automatic and picked up without a restart):
+#   sudo certbot certonly --webroot -w /var/www/acme -d mydomain.com -d www.mydomain.com
+use_https=false
+https_port=443
+
+# Folder certbot --webroot writes its challenge files into (the -w above)
+acme_webroot=/var/www/acme
+
+# Where certbot keeps certificates, one folder per domain
+cert_dir=/etc/letsencrypt/live
+
 # Path routes: /prefix = target. A prefix matches whole path segments only,
 # and the bare prefix (/phex) redirects to /phex/
 [routes]
