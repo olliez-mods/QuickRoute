@@ -30,6 +30,7 @@ SORTED_ROUTES = sorted(((r.strip('/'), t) for r, t in ROUTES.items()), key=lambd
 # is loaded on the next connection, so renewals never need a restart
 cert_cache = {}  # cert name -> (mtime, SSLContext)
 cert_lock = threading.Lock()
+missing_certs = set()
 
 def cert_files(host):
     # The host's own certificate, or for www.x the certificate of x (certbot -d x -d www.x)
@@ -68,6 +69,10 @@ def pick_certificate(ssl_socket, server_name, base_context):
         return
     if context:
         ssl_socket.context = context
+    elif server_name not in missing_certs:
+        # Logged once per name; without a certificate the browser shows ERR_SSL_VERSION_OR_CIPHER_MISMATCH
+        missing_certs.add(server_name)
+        print(f"No certificate for {server_name} in {cert_dir} (missing, or not readable by this user)")
 
 https_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 https_context.sni_callback = pick_certificate
