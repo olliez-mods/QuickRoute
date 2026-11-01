@@ -20,7 +20,8 @@ ROUTES = QuickIni.get_all("routes")
 DOMAIN_ROUTES = QuickIni.get_all("domains")
 # ======================================================================
 
-app = Flask(__name__)
+# No static folder: Flask's built-in /static route would answer /static/... itself instead of forwarding it
+app = Flask(__name__, static_folder=None)
 
 # Longest first, so a nested prefix wins over a shorter one it starts with
 SORTED_ROUTES = sorted(((r.strip('/'), t) for r, t in ROUTES.items()), key=lambda rt: len(rt[0]), reverse=True)
