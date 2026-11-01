@@ -1,0 +1,3 @@
+flask
+requests
+quick_ini

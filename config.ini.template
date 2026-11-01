@@ -1,0 +1,13 @@
+# Port the proxy listens on
+port=80
+
+# Path routes: /prefix = target. A prefix matches whole path segments only,
+# and the bare prefix (/phex) redirects to /phex/
+[routes]
+# /example = http://localhost:5000/
+# /route/exampletwo = http://localhost:2500/
+
+# Domain routes: host = target. Checked before the path routes
+[domains]
+# mydomain.com = http://localhost:5050/
+# www.mydomain.com = http://localhost:5050/
