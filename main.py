@@ -1,8 +1,11 @@
 from flask import Flask, request, Response, redirect, send_from_directory
 from quick_ini import QuickIni
 from werkzeug.serving import make_server
+from werkzeug.datastructures import EnvironHeaders
+from urllib.parse import urlsplit
 import requests
 import os
+import socket
 import ssl
 import threading
 
@@ -25,6 +28,29 @@ app = Flask(__name__, static_folder=None)
 
 # Longest first, so a nested prefix wins over a shorter one it starts with
 SORTED_ROUTES = sorted(((r.strip('/'), t) for r, t in ROUTES.items()), key=lambda rt: len(rt[0]), reverse=True)
+
+# These describe a single connection, so they're never passed through in either direction
+HOP_BY_HOP = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+              'te', 'trailers', 'transfer-encoding', 'upgrade'}
+
+def find_target(host, path):
+    # The service URL for host and path, or None when nothing matches (a bare prefix doesn't)
+    if host in DOMAIN_ROUTES:
+        return DOMAIN_ROUTES[host] + path
+    for route, target in SORTED_ROUTES:
+        if path.startswith(route + '/'):
+            return target + path[len(route) + 1:]
+    return None
+
+def forwarded_headers(incoming, remote_addr, scheme, host):
+    # Tell the service who really connected (werkzeug's ProxyFix reads these)
+    headers = {key: value for key, value in incoming
+               if key.lower() not in HOP_BY_HOP and key.lower() not in ('host', 'content-length')}
+    forwarded_for = incoming.get('X-Forwarded-For')
+    headers['X-Forwarded-For'] = f"{forwarded_for}, {remote_addr}" if forwarded_for else remote_addr
+    headers['X-Forwarded-Proto'] = scheme
+    headers['X-Forwarded-Host'] = host
+    return headers
 
 # HTTPS certificates ===================================================
 # Each new connection picks its domain's certbot certificate (SNI), and a renewed certificate
@@ -100,32 +126,21 @@ def proxy(path):
         https_host = host if https_port == 443 else f"{host}:{https_port}"
         return redirect(f"https://{https_host}/{path}" + ('?' + query_string if query_string else ''), 308)
 
-    # --- 1. Check domain-based routing ---
-    if host in DOMAIN_ROUTES:
-        target = DOMAIN_ROUTES[host]
-        target_url = target + path
-    else:
-        # --- 2. Fall back to path-based routing ---
-        for route, target in SORTED_ROUTES:
+    # A bare path prefix redirects to prefix/ (308 keeps the method and body)
+    if host not in DOMAIN_ROUTES:
+        for route, _ in SORTED_ROUTES:
             if path == route:
-                # 308 keeps the method and body
                 return redirect('/' + route + '/' + ('?' + query_string if query_string else ''), 308)
-            if path.startswith(route + '/'):
-                target_url = target + path[len(route) + 1:]
-                break
-        else:
-            return Response('Not Found', status=404)
+
+    target_url = find_target(host, path)
+    if target_url is None:
+        return Response('Not Found', status=404)
 
     # Append query parameters
     if query_string:
         target_url = f"{target_url}?{query_string}"
 
-    # Tell the service who really connected (werkzeug's ProxyFix reads these)
-    headers = {key: value for key, value in request.headers if key != 'Host'}
-    forwarded_for = request.headers.get('X-Forwarded-For')
-    headers['X-Forwarded-For'] = f"{forwarded_for}, {request.remote_addr}" if forwarded_for else request.remote_addr
-    headers['X-Forwarded-Proto'] = request.scheme
-    headers['X-Forwarded-Host'] = request.host
+    headers = forwarded_headers(request.headers, request.remote_addr, request.scheme, request.host)
 
     # Forward the request
     try:
@@ -141,11 +156,91 @@ def proxy(path):
     except requests.exceptions.Timeout: return Response('Service Timeout', status=504)
     except requests.exceptions.RequestException: return Response('Bad Gateway', status=502)
 
-    # Build response
-    proxy_response = Response(response.content, response.status_code)
-    for key, value in response.headers.items():
-        proxy_response.headers[key] = value
-    return proxy_response
+    # Build response. requests has already un-chunked and decompressed the body, so the service's
+    # framing headers no longer apply (werkzeug sets Content-Length). raw.headers keeps each
+    # Set-Cookie separate, where response.headers would join them into one.
+    excluded = HOP_BY_HOP | {'content-length', 'content-encoding'}
+    response_headers = [(key, value) for key, value in response.raw.headers.items() if key.lower() not in excluded]
+    return Response(response.content, response.status_code, headers=response_headers)
+
+# WebSockets ===========================================================
+# requests can't do an HTTP Upgrade, so a WebSocket request (e.g. Cockpit's /cockpit/socket) is
+# tunnelled instead: the request goes to the service over a raw socket, then bytes are copied both
+# ways untouched until either side closes. This sits outside Flask because it takes over werkzeug's
+# client socket, which Flask would otherwise write a second response onto.
+def pipe(source, destination):
+    try:
+        while data := source.recv(65536):
+            destination.sendall(data)
+    except OSError:
+        pass
+    finally:
+        # Wake the other direction. socket.socket.shutdown on purpose: SSLSocket.shutdown drops its
+        # TLS state, which the other thread may still be using.
+        for sock in (source, destination):
+            try:
+                socket.socket.shutdown(sock, socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+class WebSocketTunnel:
+    def __init__(self, wsgi_app):
+        self.wsgi_app = wsgi_app
+
+    def __call__(self, environ, start_response):
+        client = environ.get('werkzeug.socket')
+        if environ.get('HTTP_UPGRADE', '').lower() != 'websocket' or client is None:
+            return self.wsgi_app(environ, start_response)
+
+        host_header = environ.get('HTTP_HOST', '')
+        host = host_header.split(':')[0]
+        scheme = environ['wsgi.url_scheme']
+        # RAW_URI keeps the path as the client encoded it, so it can go straight into the request line
+        path = urlsplit(environ.get('RAW_URI', '/')).path.lstrip('/')
+        target_url = find_target(host, path)
+        # Left to Flask, whose router turns down WebSocket requests to its plain routes with a 400
+        if target_url is None or (use_https and scheme == 'http' and cert_files(host)):
+            return self.wsgi_app(environ, start_response)
+
+        target = urlsplit(target_url)
+        query_string = environ.get('QUERY_STRING', '')
+        try:
+            upstream = socket.create_connection((target.hostname, target.port or (443 if target.scheme == 'https' else 80)), timeout=10)
+            if target.scheme == 'https':
+                # A local service, usually with a self-signed certificate
+                tls = ssl.create_default_context()
+                tls.check_hostname = False
+                tls.verify_mode = ssl.CERT_NONE
+                upstream = tls.wrap_socket(upstream, server_hostname=target.hostname)
+            upstream.settimeout(None)
+        except OSError:
+            return Response('Service Unreachable', status=503)(environ, start_response)
+
+        headers = forwarded_headers(EnvironHeaders(environ), environ.get('REMOTE_ADDR', ''), scheme, host_header)
+        headers['Connection'] = 'Upgrade'
+        headers['Upgrade'] = environ['HTTP_UPGRADE']
+        lines = [f"{environ['REQUEST_METHOD']} {target.path or '/'}{'?' + query_string if query_string else ''} HTTP/1.1",
+                 f"Host: {target.netloc}"]
+        lines += [f"{key}: {value}" for key, value in headers.items()]
+        # The client sends nothing more until it sees the service's 101, so werkzeug hasn't buffered
+        # anything past the headers and the client socket can be read directly
+        client.settimeout(None)
+        try:
+            upstream.sendall(('\r\n'.join(lines) + '\r\n\r\n').encode('latin-1'))
+        except OSError:
+            upstream.close()
+            return Response('Bad Gateway', status=502)(environ, start_response)
+
+        to_upstream = threading.Thread(target=pipe, args=(client, upstream), daemon=True)
+        to_upstream.start()
+        pipe(upstream, client)
+        to_upstream.join()
+        upstream.close()
+        # Werkzeug treats this as a dropped connection, so it writes nothing more to the client
+        raise ConnectionResetError('WebSocket closed')
+
+app.wsgi_app = WebSocketTunnel(app.wsgi_app)
+# ======================================================================
 
 if __name__ == '__main__':
     if(use_https):
