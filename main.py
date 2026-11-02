@@ -1,6 +1,6 @@
 from flask import Flask, request, Response, redirect, send_from_directory
 from quick_ini import QuickIni
-from werkzeug.serving import make_server
+from werkzeug.serving import make_server, WSGIRequestHandler
 from werkzeug.datastructures import EnvironHeaders
 from urllib.parse import urlsplit
 import requests
@@ -244,7 +244,15 @@ app.wsgi_app = WebSocketTunnel(app.wsgi_app)
 
 if __name__ == '__main__':
     if(use_https):
-        https_server = make_server('0.0.0.0', https_port, app, threaded=True, ssl_context=https_context)
+        # Werkzeug's ssl_context would do the TLS handshake inside accept(), on the one thread that takes
+        # every connection, so a single client that connects and sends nothing (port scanners do this)
+        # stalls all of HTTPS. Wrapped like this, the handshake happens on the connection's own thread
+        # instead, and the timeout drops connections that go quiet.
+        class TimeoutHandler(WSGIRequestHandler):
+            timeout = 60
+        https_server = make_server('0.0.0.0', https_port, app, threaded=True, request_handler=TimeoutHandler)
+        https_server.socket = https_context.wrap_socket(https_server.socket, server_side=True, do_handshake_on_connect=False)
+        https_server.ssl_context = https_context  # werkzeug reads this for wsgi.url_scheme
         threading.Thread(target=https_server.serve_forever, daemon=True).start()
         print(f"HTTPS on port {https_port}, certificates from {cert_dir}")
     app.run(debug=False, port=port, host='0.0.0.0')
